@@ -2,6 +2,7 @@
 //!
 //! - Startup AOT preload from [`ArtifactStore::load_all`] into an immutable in-memory map.
 //! - O(1) [`JitBackend::lookup`] that only reads the resident map.
+//! - [`JitBackend::lookup_or_link`], which links a stored AOT artifact on the calling thread.
 //! - Fire-and-forget lookup-observed events to the backend thread.
 //! - Background JIT compilation for hot keys (threshold-based promotion).
 
@@ -126,6 +127,13 @@ pub(crate) struct BackendInner {
     /// State for lazily spawning the backend thread.
     #[debug(skip)]
     lazy_spawn: std::sync::Mutex<Option<LazySpawnState>>,
+    /// Artifact store probed by [`JitBackend::lookup_or_link`], with the compile-config hash
+    /// of the keys this backend loads.
+    #[debug(skip)]
+    store: Option<(Arc<dyn ArtifactStore>, B256)>,
+    /// Idle linkers for [`JitBackend::lookup_or_link`]; each link in progress takes one.
+    #[debug(skip)]
+    linkers: std::sync::Mutex<Vec<JitObjectLinker>>,
 }
 
 /// State kept around for lazily spawning the backend thread.
@@ -192,6 +200,8 @@ impl JitBackend {
             "custom hosts require JIT without an artifact store"
         );
         let enabled = config.enabled;
+        let store =
+            config.store.clone().map(|store| (store, storage::compile_config_hash(&config)));
         let (tx, rx) = chan::bounded::<Command>(config.tuning.channel_capacity);
         let events = ArrayQueue::new(config.tuning.channel_capacity);
         let tuning = config.tuning;
@@ -214,6 +224,8 @@ impl JitBackend {
                 shutdown_timeout: config.tuning.shutdown_timeout,
                 tuning,
                 lazy_spawn: std::sync::Mutex::new(Some(LazySpawnState { rx, config })),
+                store,
+                linkers: std::sync::Mutex::new(Vec::new()),
             }),
         };
         this.set_enabled(enabled)?;
@@ -383,6 +395,61 @@ impl JitBackend {
         match self.get_compiled_tracked(code_hash, spec_id) {
             Some(program) => LookupDecision::Compiled(program),
             None => LookupDecision::Unavailable(LookupMissReason::JitFailed),
+        }
+    }
+
+    /// Looks up a compiled function, linking a stored AOT artifact on the calling thread on a
+    /// miss.
+    ///
+    /// Like [`lookup`](Self::lookup), except that when the artifact store holds an artifact this
+    /// backend would load for the key, the caller reads and links it and gets
+    /// [`LookupDecision::Compiled`] instead of [`NotReady`](LookupMissReason::NotReady). Linking
+    /// never waits on the backend thread or the compile workers, so concurrent callers link
+    /// concurrently. Every miss probes the store; a miss the store cannot serve, or whose link
+    /// fails, behaves as `lookup`.
+    pub fn lookup_or_link(&self, req: LookupRequest<'_>) -> LookupDecision {
+        let inner = &*self.inner;
+        if inner.blocking
+            || !inner.enabled.load(Ordering::Relaxed)
+            || !inner.tuning.should_compile(req.code.as_slice())
+            || inner.shared.resident.contains_key(&req.key)
+        {
+            return self.lookup(req);
+        }
+        let Some(program) = self.link_stored(req.key) else { return self.lookup(req) };
+        // A concurrent caller may have linked the same key first; keep its program.
+        let program = Arc::clone(&inner.shared.resident.entry(req.key).or_insert(program));
+        // A hit event, so the backend records the program for eviction.
+        let event = LookupEvent { key: req.key, code: Bytes::new() };
+        if let Err(_v) = inner.shared.events.push(event) {
+            inner.shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        LookupDecision::Compiled(program)
+    }
+
+    /// Links the stored artifact for `key`, if the store holds one this backend would load.
+    fn link_stored(&self, key: RuntimeCacheKey) -> Option<Arc<CompiledProgram>> {
+        let inner = &*self.inner;
+        let (store, config_hash) = inner.store.as_ref()?;
+        let artifact_key = ArtifactKey::llvm(key, inner.tuning.aot_opt_level, *config_hash);
+        let stored = match store.load(&artifact_key) {
+            Ok(Some(stored)) if stored.manifest.artifact_key == artifact_key => stored,
+            Ok(_) => return None,
+            Err(error) => {
+                warn!(code_hash = %key.code_hash, %error, "failed to probe artifact store");
+                return None;
+            }
+        };
+        let idle = inner.linkers.lock().unwrap().pop();
+        let mut linker = idle.unwrap_or_else(|| JitObjectLinker::new(inner.host.resolver));
+        let linked = linker.link_stored(key, &stored);
+        inner.linkers.lock().unwrap().push(linker);
+        match linked {
+            Ok(program) => Some(Arc::new(program)),
+            Err(error) => {
+                warn!(code_hash = %key.code_hash, %error, "failed to link stored artifact");
+                None
+            }
         }
     }
 

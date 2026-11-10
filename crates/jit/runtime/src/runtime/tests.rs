@@ -256,6 +256,40 @@ impl ArtifactStore for CountingStore {
     }
 }
 
+/// A store whose `load_all` is empty, so startup links nothing, while `load` still serves.
+#[cfg(feature = "llvm")]
+struct LoadOnMissStore {
+    inner: Arc<RuntimeArtifactStore>,
+}
+
+#[cfg(feature = "llvm")]
+impl ArtifactStore for LoadOnMissStore {
+    fn load_all(&self) -> eyre::Result<Vec<(ArtifactKey, StoredArtifact)>> {
+        Ok(Vec::new())
+    }
+
+    fn load(&self, key: &ArtifactKey) -> eyre::Result<Option<StoredArtifact>> {
+        self.inner.load(key)
+    }
+
+    fn store(
+        &self,
+        key: &ArtifactKey,
+        manifest: &ArtifactManifest,
+        object_bytes: &[u8],
+    ) -> eyre::Result<()> {
+        self.inner.store(key, manifest, object_bytes)
+    }
+
+    fn delete(&self, key: &ArtifactKey) -> eyre::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn clear(&self) -> eyre::Result<()> {
+        self.inner.clear()
+    }
+}
+
 #[cfg(feature = "llvm")]
 #[derive(Clone, Copy, Debug)]
 enum AotFailure {
@@ -1833,6 +1867,80 @@ fn preload_aot_skips_manifest_key_mismatch() {
     })
     .unwrap();
     assert_eq!(tb.stats().compilations_dispatched, 1);
+}
+
+/// Compiles `BYTECODE_RET42` for Cancun into `store`.
+#[cfg(feature = "llvm")]
+fn store_ret42(store: Arc<dyn ArtifactStore>) {
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        store: Some(store),
+        tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+        ..Default::default()
+    });
+    tb.prepare_aot_sync(AotRequest {
+        code_hash: alloy_primitives::keccak256(BYTECODE_RET42),
+        code: Bytes::from_static(BYTECODE_RET42),
+        spec_id: SpecId::CANCUN,
+    })
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn lookup_or_link_links_stored_artifact_on_the_caller() {
+    let inner = Arc::new(RuntimeArtifactStore::new().unwrap());
+    store_ret42(inner.clone());
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        store: Some(Arc::new(LoadOnMissStore { inner })),
+        tuning: RuntimeTuning {
+            jit_worker_count: 1,
+            idle_evict_duration: Some(std::time::Duration::from_millis(100)),
+            eviction_sweep_interval: std::time::Duration::from_millis(50),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert_eq!(tb.stats().resident_entries, 0);
+
+    let req = TestBackend::req_cancun(BYTECODE_RET42);
+    let decision = tb.lookup_or_link(req);
+    assert!(
+        matches!(&decision, LookupDecision::Compiled(program) if program.kind == ProgramKind::Aot),
+        "expected the stored artifact linked on the first lookup, got: {decision:?}",
+    );
+    drop(decision);
+
+    // The backend tracks the program it did not link, so idle eviction removes it.
+    tb.wait_resident_count(0);
+    let decision = tb.lookup_or_link(req);
+    assert!(
+        matches!(&decision, LookupDecision::Compiled(program) if program.kind == ProgramKind::Aot),
+        "expected the evicted artifact linked again, got: {decision:?}",
+    );
+    assert_eq!(tb.stats().compilations_dispatched, 0);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn lookup_or_link_falls_back_to_lookup() {
+    let inner = Arc::new(RuntimeArtifactStore::new().unwrap());
+    store_ret42(inner.clone());
+    let (key, stored) = inner.load_all().unwrap().pop().unwrap();
+    inner.store(&key, &stored.manifest, b"not an object").unwrap();
+    let tb = TestBackend::with_store(
+        Arc::new(LoadOnMissStore { inner }),
+        RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+    );
+
+    for bytecode in [BYTECODE_ADD, BYTECODE_RET42] {
+        let decision = tb.lookup_or_link(TestBackend::req_cancun(bytecode));
+        assert!(
+            matches!(decision, LookupDecision::Unavailable(LookupMissReason::NotReady)),
+            "expected a miss without a linkable artifact, got: {decision:?}",
+        );
+    }
 }
 
 #[test]
