@@ -7,9 +7,7 @@
 
 use crate::eyre::{self, WrapErr};
 use alloy_primitives::B256;
-use backend::{
-    Command, CompileJitRequest, EventQueue, JitObjectLinker, PrepareAotRequest, ResidentMap,
-};
+use backend::{Command, CompileJitRequest, EventQueue, PrepareAotRequest, ResidentMap};
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
 use evm2::SpecId;
@@ -687,12 +685,12 @@ impl JitBackend {
         info!(count = artifacts.len(), "loading AOT artifacts");
 
         let config_hash = storage::compile_config_hash(config);
-        let mut linker = JitObjectLinker::new(config.host.resolver);
         let mut out: Vec<(RuntimeCacheKey, Arc<CompiledProgram>)> =
             Vec::with_capacity(artifacts.len());
         let mut loaded = 0u64;
         let mut failed = 0u64;
         let mut skipped = 0u64;
+        let mut matched = Vec::new();
 
         for (artifact_key, stored) in artifacts {
             let key = artifact_key.runtime;
@@ -707,16 +705,24 @@ impl JitBackend {
                 skipped += 1;
                 continue;
             }
+            matched.push((key, stored));
+        }
 
-            match linker.link_stored(key, &stored) {
+        let linked = backend::link_stored_parallel(
+            matched,
+            config.tuning.jit_worker_count,
+            config.host.resolver,
+        )?;
+        for (key, program) in linked {
+            match program {
                 Ok(program) => {
                     out.push((key, Arc::new(program)));
                     loaded += 1;
                 }
-                Err(e) => {
+                Err(error) => {
                     warn!(
-                        code_hash = %artifact_key.runtime.code_hash,
-                        error = %e,
+                        code_hash = %key.code_hash,
+                        %error,
                         "failed to load artifact, skipping",
                     );
                     failed += 1;

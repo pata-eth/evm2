@@ -23,12 +23,16 @@ use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use quanta::Instant;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 #[cfg(feature = "llvm")]
 use std::ffi::CString;
 use std::{
     fs, mem,
     ops::ControlFlow,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -150,6 +154,144 @@ impl JitObjectLinker {
     }
 }
 
+/// One stored object for [`StoredLinkPool`] to link.
+struct StoredLinkJob {
+    key: RuntimeCacheKey,
+    stored: StoredArtifact,
+    bytecode: Bytes,
+    mode: AdmitMode,
+    /// Phase to restore when the link fails. A failed AOT entry stays failed.
+    previous: EntryPhase,
+    sync_notifier: SyncNotifier,
+    generation: u64,
+}
+
+/// The program a link worker produced, or the error from linking it.
+struct StoredLinkResult {
+    key: RuntimeCacheKey,
+    program: eyre::Result<CompiledProgram>,
+    bytecode: Bytes,
+    mode: AdmitMode,
+    previous: EntryPhase,
+    sync_notifier: SyncNotifier,
+    generation: u64,
+}
+
+/// Links stored objects on a rayon pool.
+///
+/// `EvmLlvmBackend` is used through `&mut self`, so each worker keeps its own
+/// linker. The process has one LLJIT and it is `Sync`, so those workers share it.
+struct StoredLinkPool {
+    pool: Option<rayon::ThreadPool>,
+    shutdown: Arc<AtomicBool>,
+    result_tx: chan::Sender<StoredLinkResult>,
+    resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>,
+}
+
+impl StoredLinkPool {
+    fn new(
+        threads: usize,
+        resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>,
+    ) -> eyre::Result<(Self, chan::Receiver<StoredLinkResult>)> {
+        let (result_tx, result_rx) = chan::unbounded();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .thread_name(|i| format!("evm2_link-{i:02}"))
+            .build()
+            .wrap_err("failed to spawn link pool")?;
+        Ok((
+            Self {
+                pool: Some(pool),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                result_tx,
+                resolver,
+            },
+            result_rx,
+        ))
+    }
+
+    fn spawn(&self, job: StoredLinkJob) {
+        let Some(pool) = self.pool.as_ref() else {
+            job.sync_notifier.notify();
+            return;
+        };
+        let shutdown = Arc::clone(&self.shutdown);
+        let result_tx = self.result_tx.clone();
+        let resolver = self.resolver;
+        pool.spawn_fifo(move || {
+            // A job that has not started only delays shutdown. The backend drops the result.
+            if shutdown.load(Ordering::Acquire) {
+                job.sync_notifier.notify();
+                return;
+            }
+            let program =
+                with_thread_linker(resolver, |linker| linker.link_stored(job.key, &job.stored));
+            let _ = result_tx.send(StoredLinkResult {
+                key: job.key,
+                program,
+                bytecode: job.bytecode,
+                mode: job.mode,
+                previous: job.previous,
+                sync_notifier: job.sync_notifier,
+                generation: job.generation,
+            });
+        });
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.pool.take();
+    }
+}
+
+impl Drop for StoredLinkPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Links `artifacts` on `threads` workers and waits until every one has finished.
+pub(crate) fn link_stored_parallel(
+    artifacts: Vec<(RuntimeCacheKey, StoredArtifact)>,
+    threads: usize,
+    resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>,
+) -> eyre::Result<Vec<(RuntimeCacheKey, eyre::Result<CompiledProgram>)>> {
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .thread_name(|i| format!("evm2_link-{i:02}"))
+        .build()
+        .wrap_err("failed to spawn link pool")?;
+    Ok(pool.install(|| {
+        artifacts
+            .into_par_iter()
+            .map(|(key, stored)| {
+                let program =
+                    with_thread_linker(resolver, |linker| linker.link_stored(key, &stored));
+                (key, program)
+            })
+            .collect()
+    }))
+}
+
+/// The first call on a worker builds its linker. Later calls on that thread reuse it.
+fn with_thread_linker<T>(
+    resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>,
+    f: impl FnOnce(&mut JitObjectLinker) -> T,
+) -> T {
+    thread_local! {
+        static LINKER: std::cell::RefCell<Option<JitObjectLinker>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    LINKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let linker = slot.get_or_insert_with(|| JitObjectLinker::new(resolver));
+        f(linker)
+    })
+}
+
 /// Commands sent to the backend thread on the bounded command channel.
 ///
 /// Lookup-observed events are NOT carried here — they go through the
@@ -216,7 +358,7 @@ struct EntryState {
 enum EntryPhase {
     /// Not yet hot enough for JIT.
     Cold,
-    /// JIT compilation in progress on a worker.
+    /// Compilation, or linking of a stored artifact, is in progress on a worker.
     Working,
     /// Compilation of this kind failed at this time; the key is not retried for that kind until
     /// the entry is swept.
@@ -253,6 +395,10 @@ struct BackendState {
     workers: WorkerPool,
     /// Backend-thread-owned linker for out-of-process JIT objects.
     jit_object_linker: JitObjectLinker,
+    /// Pool that links stored artifacts off the backend thread.
+    link_pool: StoredLinkPool,
+    /// Receiver for stored-artifact link results.
+    link_rx: chan::Receiver<StoredLinkResult>,
     /// Receiver for worker results.
     result_rx: chan::Receiver<WorkerResult>,
     /// Artifact store for persisted artifacts.
@@ -345,7 +491,7 @@ impl BackendState {
         kind: CompilationKind,
         key: RuntimeCacheKey,
         bytecode: Bytes,
-        sync_notifier: SyncNotifier,
+        mut sync_notifier: SyncNotifier,
         mode: AdmitMode,
     ) {
         // A resident JIT program still needs an AOT artifact to be persisted.
@@ -372,9 +518,11 @@ impl BackendState {
             return;
         }
 
-        if kind == CompilationKind::Aot && self.try_load_persisted_aot(&key) {
-            sync_notifier.notify();
-            return;
+        if kind == CompilationKind::Aot {
+            match self.enqueue_persisted_aot(key, &bytecode, sync_notifier, mode) {
+                Ok(()) => return,
+                Err(notifier) => sync_notifier = notifier,
+            }
         }
 
         let now = Instant::now();
@@ -421,62 +569,13 @@ impl BackendState {
             }
         }
 
-        if self.pending_jobs >= self.tuning.jit_max_pending_jobs {
-            sync_notifier.notify();
-            return;
-        }
-
-        let prefix = match kind {
-            CompilationKind::Jit => "jit",
-            CompilationKind::Aot => "aot",
-        };
-        let opt_level = match kind {
-            CompilationKind::Jit => self.tuning.jit_opt_level,
-            CompilationKind::Aot => self.tuning.aot_opt_level,
-        };
-        let symbol = format!("{prefix}_{:x}_{:?}", key.code_hash, key.spec_id);
-        let job = CompileJob {
-            kind,
-            key,
-            bytecode: entry.bytecode.clone(),
-            symbol_name: symbol,
-            opt_level,
-            sync_notifier,
-            generation: self.generation,
-        };
-
-        match self.workers.try_send(job) {
-            Ok(()) => {
-                debug!(
-                    code_hash = %key.code_hash,
-                    spec_id = ?key.spec_id,
-                    ?kind,
-                    hotness = entry.hotness,
-                    pending_jobs = self.pending_jobs + 1,
-                    "dispatched compilation",
-                );
-                entry.phase = EntryPhase::Working;
-                self.unlink_cold_entry(&key);
-                self.pending_jobs += 1;
-                self.inner.stats.compilations_dispatched.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(job) => {
-                warn!(code_hash = %key.code_hash, "worker pool saturated, dropping request");
-                job.sync_notifier.notify();
-            }
-        }
+        self.dispatch_working(kind, key, sync_notifier);
     }
 
-    /// Tries to load an already-persisted AOT artifact from the store into the resident map.
-    /// Returns `true` if the artifact was loaded successfully.
-    fn try_load_persisted_aot(&mut self, key: &RuntimeCacheKey) -> bool {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return false,
-        };
-
+    /// The stored artifact this backend would link for `key`, when the manifest matches.
+    fn stored_artifact(&self, key: &RuntimeCacheKey) -> Option<StoredArtifact> {
+        let store = self.store.as_ref()?;
         let artifact_key = self.artifact_key(*key);
-
         match store.load(&artifact_key) {
             Ok(Some(stored)) if stored.manifest.artifact_key != artifact_key => {
                 debug!(
@@ -484,35 +583,16 @@ impl BackendState {
                     manifest_key = ?stored.manifest.artifact_key,
                     "artifact manifest key mismatch, will recompile",
                 );
-                false
+                None
             }
-            Ok(Some(stored)) => match self.jit_object_linker.link_stored(*key, &stored) {
-                Ok(program) => {
-                    debug!(
-                        code_hash = %key.code_hash,
-                        spec_id = ?key.spec_id,
-                        "loaded existing AOT artifact from store, skipping recompilation",
-                    );
-                    self.insert_resident(*key, Arc::new(program));
-                    true
-                }
-                Err(e) => {
-                    warn!(
-                        code_hash = %key.code_hash,
-                        error = %e,
-                        "failed to load persisted AOT artifact, will recompile",
-                    );
-                    false
-                }
-            },
-            Ok(None) => false,
-            Err(e) => {
+            Ok(stored) => stored,
+            Err(error) => {
                 warn!(
                     code_hash = %key.code_hash,
-                    error = %e,
+                    %error,
                     "failed to probe artifact store",
                 );
-                false
+                None
             }
         }
     }
@@ -945,6 +1025,232 @@ impl BackendState {
     const fn artifact_key(&self, key: RuntimeCacheKey) -> ArtifactKey {
         ArtifactKey::llvm(key, self.tuning.aot_opt_level, self.config_hash)
     }
+
+    /// Queues a link of the stored artifact for `key`.
+    ///
+    /// `Ok` means the caller is waiting on that link, or on a job already in flight.
+    /// `Err` returns the notifier so admission can compile instead.
+    fn enqueue_persisted_aot(
+        &mut self,
+        key: RuntimeCacheKey,
+        bytecode: &Bytes,
+        sync_notifier: SyncNotifier,
+        mode: AdmitMode,
+    ) -> Result<(), SyncNotifier> {
+        let Some(stored) = self.stored_artifact(&key) else { return Err(sync_notifier) };
+        if self.entries.get(&key).is_some_and(|entry| entry.phase == EntryPhase::Working) {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                sync_notifier.retain_waiter(&mut entry.pending_notifiers);
+            }
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let previous = match self.entries.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                let previous = entry.phase;
+                entry.bytecode = bytecode.clone();
+                entry.last_observed_at = now;
+                entry.phase = EntryPhase::Working;
+                previous
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(EntryState {
+                    hotness: 0,
+                    transient_failed: false,
+                    phase: EntryPhase::Working,
+                    bytecode: bytecode.clone(),
+                    last_observed_at: now,
+                    pending_notifiers: Vec::new(),
+                    cold_links: None,
+                });
+                EntryPhase::Cold
+            }
+        };
+        self.unlink_cold_entry(&key);
+        self.pending_jobs += 1;
+        self.link_pool.spawn(StoredLinkJob {
+            key,
+            stored,
+            bytecode: bytecode.clone(),
+            mode,
+            previous,
+            sync_notifier,
+            generation: self.generation,
+        });
+        Ok(())
+    }
+
+    /// Publishes a stored-artifact link, or compiles the key when the link fails.
+    fn handle_stored_link(&mut self, result: StoredLinkResult) {
+        self.pending_jobs = self.pending_jobs.saturating_sub(1);
+        if result.generation != self.generation {
+            debug!(
+                code_hash = %result.key.code_hash,
+                result_gen = result.generation,
+                current_gen = self.generation,
+                "discarding stale link result",
+            );
+            result.sync_notifier.notify();
+            return;
+        }
+
+        let pending_notifiers = self
+            .entries
+            .get_mut(&result.key)
+            .map(|entry| mem::take(&mut entry.pending_notifiers))
+            .unwrap_or_default();
+        match result.program {
+            Ok(program) => {
+                debug!(
+                    code_hash = %result.key.code_hash,
+                    spec_id = ?result.key.spec_id,
+                    "loaded existing AOT artifact from store, skipping recompilation",
+                );
+                self.insert_resident(result.key, Arc::new(program));
+                self.remove_entry(&result.key);
+                result.sync_notifier.notify();
+                for notifier in pending_notifiers {
+                    notifier.notify();
+                }
+            }
+            Err(error) => {
+                warn!(
+                    code_hash = %result.key.code_hash,
+                    %error,
+                    "failed to load persisted AOT artifact",
+                );
+                if let Some(entry) = self.entries.get_mut(&result.key) {
+                    entry.phase = result.previous;
+                    entry.pending_notifiers = pending_notifiers;
+                }
+                if matches!(result.previous, EntryPhase::Cold | EntryPhase::Failed(..))
+                    && self.entries.contains_key(&result.key)
+                {
+                    self.link_cold_entry(&result.key);
+                }
+                // A failed link used to fall through to admission. An entry that already failed
+                // this kind is not compiled again; a successful link above is what clears it.
+                if let EntryPhase::Failed(_, CompilationKind::Aot) = result.previous {
+                    let pending = self
+                        .entries
+                        .get_mut(&result.key)
+                        .map(|entry| mem::take(&mut entry.pending_notifiers))
+                        .unwrap_or_default();
+                    result.sync_notifier.notify();
+                    for notifier in pending {
+                        notifier.notify();
+                    }
+                    return;
+                }
+                self.continue_after_failed_load(
+                    result.key,
+                    result.bytecode,
+                    result.sync_notifier,
+                    result.mode,
+                );
+            }
+        }
+    }
+
+    /// Admission after a stored artifact failed to link. The entry is already restored.
+    fn continue_after_failed_load(
+        &mut self,
+        key: RuntimeCacheKey,
+        bytecode: Bytes,
+        sync_notifier: SyncNotifier,
+        mode: AdmitMode,
+    ) {
+        let Some(entry) = self.entries.get_mut(&key) else {
+            sync_notifier.notify();
+            return;
+        };
+        entry.bytecode = bytecode;
+        entry.last_observed_at = Instant::now();
+        if let EntryPhase::Failed(_, failed_kind) = entry.phase {
+            if failed_kind == CompilationKind::Aot {
+                let pending = mem::take(&mut entry.pending_notifiers);
+                sync_notifier.notify();
+                for notifier in pending {
+                    notifier.notify();
+                }
+                return;
+            }
+            entry.phase = EntryPhase::Cold;
+            entry.hotness = 0;
+        }
+        if matches!(mode, AdmitMode::Observed) {
+            entry.hotness = entry.hotness.saturating_add(1);
+            if (entry.hotness as usize) < self.tuning.jit_hot_threshold {
+                return;
+            }
+        }
+        self.dispatch_working(CompilationKind::Aot, key, sync_notifier);
+    }
+
+    /// Sends a compile job for an entry that is already admitted and not working.
+    fn dispatch_working(
+        &mut self,
+        kind: CompilationKind,
+        key: RuntimeCacheKey,
+        sync_notifier: SyncNotifier,
+    ) {
+        let Some(entry) = self.entries.get_mut(&key) else {
+            sync_notifier.notify();
+            return;
+        };
+        if entry.phase == EntryPhase::Working {
+            sync_notifier.retain_waiter(&mut entry.pending_notifiers);
+            return;
+        }
+        if self.pending_jobs >= self.tuning.jit_max_pending_jobs {
+            sync_notifier.notify();
+            return;
+        }
+
+        let prefix = match kind {
+            CompilationKind::Jit => "jit",
+            CompilationKind::Aot => "aot",
+        };
+        let opt_level = match kind {
+            CompilationKind::Jit => self.tuning.jit_opt_level,
+            CompilationKind::Aot => self.tuning.aot_opt_level,
+        };
+        let hotness = entry.hotness;
+        let bytecode = entry.bytecode.clone();
+        let symbol = format!("{prefix}_{:x}_{:?}", key.code_hash, key.spec_id);
+        let job = CompileJob {
+            kind,
+            key,
+            bytecode,
+            symbol_name: symbol,
+            opt_level,
+            sync_notifier,
+            generation: self.generation,
+        };
+        match self.workers.try_send(job) {
+            Ok(()) => {
+                debug!(
+                    code_hash = %key.code_hash,
+                    spec_id = ?key.spec_id,
+                    ?kind,
+                    hotness,
+                    pending_jobs = self.pending_jobs + 1,
+                    "dispatched compilation",
+                );
+                let entry = self.entries.get_mut(&key).unwrap();
+                entry.phase = EntryPhase::Working;
+                self.unlink_cold_entry(&key);
+                self.pending_jobs += 1;
+                self.inner.stats.compilations_dispatched.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(job) => {
+                warn!(code_hash = %key.code_hash, "worker pool saturated, dropping request");
+                job.sync_notifier.notify();
+            }
+        }
+    }
 }
 
 /// Runs the backend event loop. Called on the backend thread.
@@ -958,6 +1264,8 @@ pub(crate) fn run(
     let (result_tx, result_rx) = chan::unbounded::<WorkerResult>();
 
     let workers = WorkerPool::new(result_tx, config.clone(), Arc::clone(&inner.stats));
+    let (link_pool, link_rx) =
+        StoredLinkPool::new(config.tuning.jit_worker_count, config.host.resolver)?;
 
     let sweep_interval = config.tuning.eviction_sweep_interval;
     let event_drain_interval = config.tuning.event_drain_interval;
@@ -978,6 +1286,8 @@ pub(crate) fn run(
         cold_tail: None,
         workers,
         jit_object_linker: JitObjectLinker::new(config.host.resolver),
+        link_pool,
+        link_rx,
         result_rx,
         store: config.store,
         tuning: config.tuning,
@@ -1012,6 +1322,12 @@ pub(crate) fn run(
                     Err(_) => warn!("worker unexpectedly closed"),
                 }
             }
+            recv(state.link_rx) -> msg => {
+                match msg {
+                    Ok(result) => state.handle_stored_link(result),
+                    Err(_) => warn!("link pool closed"),
+                }
+            }
             default(tick) => {}
         }
         state.tick();
@@ -1019,6 +1335,10 @@ pub(crate) fn run(
 
     debug!(?shutdown_reason, stats = ?state.inner.stats(), "backend task shutting down");
 
+    state.link_pool.shutdown();
+    while let Ok(result) = state.link_rx.try_recv() {
+        result.sync_notifier.notify();
+    }
     let shutdown = state.workers.shutdown();
     while state.result_rx.try_recv().is_ok() {}
     shutdown
@@ -1045,6 +1365,7 @@ mod notifier_tests {
         });
         let (result_tx, result_rx) = chan::unbounded();
         let workers = WorkerPool::new(result_tx, config.clone(), Arc::clone(&inner.stats));
+        let (link_pool, link_rx) = StoredLinkPool::new(0, config.host.resolver).unwrap();
         BackendState {
             inner,
             resident_meta: HashMap::default(),
@@ -1053,6 +1374,8 @@ mod notifier_tests {
             cold_tail: None,
             workers,
             jit_object_linker: JitObjectLinker::new(config.host.resolver),
+            link_pool,
+            link_rx,
             result_rx,
             config_hash: compile_config_hash(&config),
             store: config.store,
@@ -1596,5 +1919,26 @@ mod tests {
         let (_first_func, _first_backing) = link(&mut linker).unwrap();
         let (_second_func, _second_backing) = link(&mut linker)
             .expect("same symbol should link while previous backing remains alive");
+    }
+
+    #[test]
+    fn link_object_on_two_threads() {
+        let success = compile_jit_object("jit_concurrent_symbol");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let object = success.object_bytes.clone();
+            let symbol = success.symbol_name.clone();
+            let builtins = success.builtin_symbols.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut linker = JitObjectLinker::new(None);
+                barrier.wait();
+                linker.link(&symbol, &object, &builtins).expect("concurrent link");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("link thread panicked");
+        }
     }
 }

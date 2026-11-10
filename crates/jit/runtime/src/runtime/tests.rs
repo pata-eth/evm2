@@ -266,6 +266,40 @@ enum AotFailure {
     NoStore,
 }
 
+/// `load_all` is empty, so startup does not link. `load` still returns a stored artifact.
+#[cfg(feature = "llvm")]
+struct LoadOnMissStore {
+    inner: RuntimeArtifactStore,
+}
+
+#[cfg(feature = "llvm")]
+impl ArtifactStore for LoadOnMissStore {
+    fn load_all(&self) -> eyre::Result<Vec<(ArtifactKey, StoredArtifact)>> {
+        Ok(Vec::new())
+    }
+
+    fn load(&self, key: &ArtifactKey) -> eyre::Result<Option<StoredArtifact>> {
+        self.inner.load(key)
+    }
+
+    fn store(
+        &self,
+        key: &ArtifactKey,
+        manifest: &ArtifactManifest,
+        object_bytes: &[u8],
+    ) -> eyre::Result<()> {
+        self.inner.store(key, manifest, object_bytes)
+    }
+
+    fn delete(&self, key: &ArtifactKey) -> eyre::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn clear(&self) -> eyre::Result<()> {
+        self.inner.clear()
+    }
+}
+
 #[cfg(feature = "llvm")]
 struct AotFailureStore {
     inner: RuntimeArtifactStore,
@@ -1760,6 +1794,49 @@ fn preload_aot_seeds_resident() {
         let tb = TestBackend::with_store(store, Default::default());
         assert_eq!(tb.stats().resident_entries, 1);
     }
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn stored_artifact_links_without_preload() {
+    let store: Arc<dyn ArtifactStore> =
+        Arc::new(LoadOnMissStore { inner: RuntimeArtifactStore::new().unwrap() });
+    let code_hash = alloy_primitives::keccak256(BYTECODE_RET42);
+    {
+        let tb = TestBackend::new(RuntimeConfig {
+            enabled: true,
+            aot: true,
+            store: Some(Arc::clone(&store)),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        });
+        tb.prepare_aot_sync(AotRequest {
+            code_hash,
+            code: Bytes::from_static(BYTECODE_RET42),
+            spec_id: SpecId::CANCUN,
+        })
+        .unwrap();
+        assert!(tb.get_compiled(code_hash, SpecId::CANCUN).is_some());
+    }
+
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(store),
+        tuning: RuntimeTuning { jit_worker_count: 2, ..Default::default() },
+        ..Default::default()
+    });
+    assert!(tb.get_compiled(code_hash, SpecId::CANCUN).is_none());
+    let decision = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    assert!(
+        matches!(&decision, LookupDecision::Unavailable(LookupMissReason::NotReady)),
+        "expected the first lookup to miss while the link is queued, got: {decision:?}",
+    );
+    let decision = tb.lookup_blocking(TestBackend::req_cancun(BYTECODE_RET42));
+    assert!(
+        matches!(&decision, LookupDecision::Compiled(program) if program.kind == ProgramKind::Aot),
+        "expected a stored artifact to link without preload, got: {decision:?}",
+    );
 }
 
 #[test]
