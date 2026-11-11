@@ -316,6 +316,10 @@ impl BackendState {
             self.inner.stats.lookup_hits.fetch_add(1, Ordering::Relaxed);
             if let Some(meta) = self.resident_meta.get_mut(&event.key) {
                 meta.last_hit_at = Instant::now();
+            } else if self.inner.resident.contains_key(&event.key) {
+                // `JitBackend::lookup_or_link` inserts programs without the backend; eviction
+                // only sees keys with metadata.
+                self.resident_meta.insert(event.key, ResidentMeta { last_hit_at: Instant::now() });
             }
         } else {
             self.inner.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
@@ -1568,6 +1572,7 @@ mod tests {
         CompileJob, WorkerSuccess, compile_jit_object_artifact, create_compiler,
     };
     use evm2::SpecId;
+    use std::sync::Barrier;
 
     /// PUSH1 0x42 PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN.
     const BYTECODE_RET42: &[u8] = &[0x60, 0x42, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3];
@@ -1602,5 +1607,22 @@ mod tests {
         let (_first_func, _first_backing) = link(&mut linker).unwrap();
         let (_second_func, _second_backing) = link(&mut linker)
             .expect("same symbol should link while previous backing remains alive");
+    }
+
+    #[test]
+    fn link_object_on_two_threads() {
+        let success = compile_jit_object("jit_concurrent_symbol");
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let mut linker = JitObjectLinker::new(None);
+                    barrier.wait();
+                    linker
+                        .link(&success.symbol_name, &success.object_bytes, &success.builtin_symbols)
+                        .expect("concurrent link");
+                });
+            }
+        });
     }
 }
